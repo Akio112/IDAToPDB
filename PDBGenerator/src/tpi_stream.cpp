@@ -1,7 +1,8 @@
-// Код Анны (generateTPI) с исправлениями под LLVM 18 / C++17.
+
 #include "tpi_stream.hpp"
 
 #include <vector>
+#include <map>
 
 #include "llvm/DebugInfo/CodeView/AppendingTypeTableBuilder.h"
 #include "llvm/DebugInfo/CodeView/CVRecord.h"
@@ -10,75 +11,125 @@
 #include "llvm/DebugInfo/PDB/Native/TpiHashing.h"
 #include "llvm/DebugInfo/PDB/Native/TpiStreamBuilder.h"
 
-llvm::Expected<FunctionTypes> generateTPI(llvm::pdb::PDBFileBuilder &PdbBuilder,
-                                          llvm::BumpPtrAllocator &Allocator) {
-    // Записи сначала превращаем в байты в отдельной таблице, номера выдаются с 0x1000.
-    // Поток TPI (TpiStreamBuilder) принимает только готовые байты, поэтому в конце переносим их туда.
+using namespace llvm;
+using namespace llvm::codeview;
+
+static TypeIndex createType(
+    const TypeRequest &req,
+    AppendingTypeTableBuilder &Table) {
+
+    TypeIndex current(req.base);
+
+    if (req.isConst) {
+        ModifierRecord modRec(current, ModifierOptions::Const);
+        current = Table.writeLeafType(modRec);
+    }
+    if (req.isPointer) {
+        PointerRecord ptrRec(
+            current, PointerKind::Near64, PointerMode::Pointer,
+            PointerOptions::None, 8);
+        current = Table.writeLeafType(ptrRec);
+    }
+
+    return current;
+}
+
+static Expected<TypeIndex> getOrCreateType(
+    const TypeRequest &req,
+    AppendingTypeTableBuilder &Table,
+    std::map<SimpleTypeKind, TypeIndex> &simpleTypes,
+    std::map<TypeRequest, TypeIndex> &complexTypes) {
+
+    // Базовый тип — не требует создания записи.
+    if (!req.isPointer && !req.isConst) {
+        auto it = simpleTypes.find(req.base);
+        if (it != simpleTypes.end()) return it->second;
+        TypeIndex ti(req.base);
+        simpleTypes[req.base] = ti;
+        return ti;
+    }
+
+    // Сложный тип — проверяем кэш, если нет — создаём через createType.
+    auto it = complexTypes.find(req);
+    if (it != complexTypes.end()) return it->second;
+
+    TypeIndex ti = createType(req, Table);
+    complexTypes[req] = ti;
+    return ti;
+}
+static TypeIndex createFunctionSignature(
+    TypeIndex returnType,
+    const std::vector<TypeIndex> &argTypes,
+    AppendingTypeTableBuilder &Table) {
+
+    ArgListRecord argListRec(TypeRecordKind::ArgList, argTypes);
+    TypeIndex argListType = Table.writeLeafType(argListRec);
+
+    ProcedureRecord procRec(
+        returnType,
+        CallingConvention::NearC,
+        FunctionOptions::None,
+        static_cast<uint16_t>(argTypes.size()),
+        argListType);
+    return Table.writeLeafType(procRec);
+}
+
+static Expected<TypeIndex> getOrCreateFunctionSignature(
+    const FunctionSignatureRequest &func,
+    AppendingTypeTableBuilder &Table,
+    std::map<SimpleTypeKind, TypeIndex> &simpleTypes,
+    std::map<TypeRequest, TypeIndex> &complexTypes,
+    std::map<FunctionSignatureRequest, TypeIndex> &functionTypes) {
+
+    auto it = functionTypes.find(func);
+    if (it != functionTypes.end()) return it->second;
+
+    auto retTi = getOrCreateType(func.returnType, Table, simpleTypes, complexTypes);
+    if (!retTi) return retTi.takeError();
+
+    std::vector<TypeIndex> argTis;
+    for (const TypeRequest &arg : func.argTypes) {
+        auto argTi = getOrCreateType(arg, Table, simpleTypes, complexTypes);
+        if (!argTi) return argTi.takeError();
+        argTis.push_back(*argTi);
+    }
+
+    TypeIndex funcSigType = createFunctionSignature(*retTi, argTis, Table);
+    functionTypes[func] = funcSigType;
+    return funcSigType;
+}
+llvm::Expected<TPITypes>  generateTPI(
+    llvm::pdb::PDBFileBuilder &PdbBuilder,
+    llvm::BumpPtrAllocator &Allocator,
+    const std::vector<llvm::codeview::SimpleTypeKind> &RequestedSimpleTypes,
+    const std::vector<TypeRequest> &RequestedComplexTypes,
+    const std::vector<FunctionSignatureRequest> &RequestedFunctions){
     llvm::codeview::AppendingTypeTableBuilder Table(Allocator);
+    TPITypes result{};
+    // Базовые типы 
+    for (llvm::codeview::SimpleTypeKind kind : RequestedSimpleTypes) {
+        result.SimpleTypes[kind] = llvm::codeview::TypeIndex(kind);
+    }
+    //Сложные типы
+   for (const TypeRequest &req : RequestedComplexTypes) {
+        auto ti = getOrCreateType(req, Table, result.SimpleTypes, result.ComplexTypes);
+        if (!ti) return ti.takeError();
+    }
+    //Сигнатуры функций
+   for (const FunctionSignatureRequest &func : RequestedFunctions) {
+        auto ti = getOrCreateFunctionSignature(
+            func, Table, result.SimpleTypes, result.ComplexTypes, result.FunctionTypes);
+        if (!ti) return ti.takeError();
+    }
 
-    llvm::codeview::TypeIndex IntType(llvm::codeview::SimpleTypeKind::Int32);
-    llvm::codeview::TypeIndex CharType(llvm::codeview::SimpleTypeKind::NarrowCharacter);
 
-    // Создаем указатель на const char (const char*) для функции my_check_password(const char *s)
-    // Шаг 1: Описываем модификатор const для char
-    llvm::codeview::ModifierRecord ModRec(CharType, llvm::codeview::ModifierOptions::Const);
-    llvm::codeview::TypeIndex ConstCharType = Table.writeLeafType(ModRec);
-
-    // Шаг 2: указатель на const char (64-битный, размер 8 байт)
-    llvm::codeview::PointerRecord PointerRec(
-        ConstCharType,                          // Ссылка на const char
-        llvm::codeview::PointerKind::Near64,
-        llvm::codeview::PointerMode::Pointer,
-        llvm::codeview::PointerOptions::None,
-        8);
-    llvm::codeview::TypeIndex ConstCharPtrType = Table.writeLeafType(PointerRec);
-
-    // Сигнатура int(const char*) для my_check_password
-    std::vector<llvm::codeview::TypeIndex> CheckPwdArgs = {ConstCharPtrType};
-    llvm::codeview::ArgListRecord CheckPwdArgListRec(llvm::codeview::TypeRecordKind::ArgList,
-                                                      CheckPwdArgs);
-    llvm::codeview::TypeIndex CheckPwdArgListType = Table.writeLeafType(CheckPwdArgListRec);
-    llvm::codeview::ProcedureRecord CheckPwdProcRec(
-        IntType,
-        llvm::codeview::CallingConvention::NearC,
-        llvm::codeview::FunctionOptions::None,
-        1,
-        CheckPwdArgListType);
-    llvm::codeview::TypeIndex CheckPwdFuncSigType = Table.writeLeafType(CheckPwdProcRec);
-
-    // Список аргументов (LF_ARGLIST) для функции int(int, int) -> принимает два int
-    std::vector<llvm::codeview::TypeIndex> Args = {IntType, IntType};
-    llvm::codeview::ArgListRecord ArgListRec(llvm::codeview::TypeRecordKind::ArgList, Args);
-    llvm::codeview::TypeIndex ArgListType = Table.writeLeafType(ArgListRec);
-    // Сигнатура функции (LF_PROCEDURE): возвращает int, принимает ArgListType
-    llvm::codeview::ProcedureRecord ProcRec(
-        IntType,                                    // Возвращаемый тип (int)
-        llvm::codeview::CallingConvention::NearC,   // Соглашение о вызовах __cdecl
-        llvm::codeview::FunctionOptions::None,
-        2,                                          // Количество параметров (2)
-        ArgListType);                               // Ссылка на список аргументов
-    llvm::codeview::TypeIndex FuncSigType = Table.writeLeafType(ProcRec);
-
-    // Сигнатура int() для main
-    std::vector<llvm::codeview::TypeIndex> NoArgs;
-    llvm::codeview::ArgListRecord MainArgListRec(llvm::codeview::TypeRecordKind::ArgList, NoArgs);
-    llvm::codeview::TypeIndex MainArgListType = Table.writeLeafType(MainArgListRec);
-    llvm::codeview::ProcedureRecord MainProcRec(
-        IntType,                                    // Возвращает int
-        llvm::codeview::CallingConvention::NearC,   // __cdecl
-        llvm::codeview::FunctionOptions::None,
-        0,                                          // Количество параметров: 0
-        MainArgListType);                           // Ссылка на пустой список аргументов
-    llvm::codeview::TypeIndex MainFuncSigType = Table.writeLeafType(MainProcRec);
-
-    // Переносим готовые записи в поток TPI самого PDB, у каждой свой хэш.
+    // Перенос в TPI-поток PDB
     auto &TpiTypes = PdbBuilder.getTpiBuilder();
-    for (llvm::ArrayRef<uint8_t> Bytes : Table.records()) {
-        auto Hash = llvm::pdb::hashTypeRecord(llvm::codeview::CVType(Bytes));
-        if (!Hash) {
-            return Hash.takeError();
-        }
+    for (ArrayRef<uint8_t> Bytes : Table.records()) {
+        auto Hash = llvm::pdb::hashTypeRecord(CVType(Bytes));
+        if (!Hash) return Hash.takeError();
         TpiTypes.addTypeRecord(Bytes, *Hash);
     }
-    return FunctionTypes{FuncSigType, CheckPwdFuncSigType, MainFuncSigType};
+
+    return result;
 }
