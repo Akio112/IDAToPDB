@@ -1,60 +1,94 @@
-// ===== Поток TPI (типы) =====
-// Часть Анны: типы функций int(int, int), int(const char*), int().
-// Позже (когда будут символы функций внутри модуля) на эти типы будут ссылаться по номеру.
 #pragma once
 
 #include "llvm/DebugInfo/CodeView/TypeIndex.h"
 #include "llvm/DebugInfo/PDB/Native/PDBFileBuilder.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/Error.h"
-#include <map>
+#include "llvm/DebugInfo/CodeView/CodeView.h"
 #include <vector>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
 
+enum class TypeKind {
+    Primitive,
+    Pointer,
+    LValueReference, // int&
+    RValueReference, //int&&
+    Array
+};
+
+enum class TypeQualifier : uint16_t { // unsigned, 2 bytes
+    None      = 0,
+    Const     = 1 << 0,
+    Volatile  = 1 << 1,
+    Unaligned = 1 << 2,
+    Restrict  = 1 << 3
+};
+using TypeQualifiers = uint16_t;
+
+constexpr TypeQualifiers operator|(
+    TypeQualifier lhs,
+    TypeQualifier rhs) {
+
+    return static_cast<TypeQualifiers>(lhs) |
+           static_cast<TypeQualifiers>(rhs);
+}
+constexpr TypeQualifiers operator|(
+    TypeQualifiers lhs,
+    TypeQualifier rhs) {
+
+    return lhs | static_cast<TypeQualifiers>(rhs);
+}
+
+constexpr bool hasQualifier(
+    TypeQualifiers flags,
+    TypeQualifier qualifier) {
+
+    return (flags & static_cast<TypeQualifiers>(qualifier)) != 0;
+}
 struct TypeRequest {
+    TypeKind kind = TypeKind::Primitive;
+
     // Базовый тип (Int32, NarrowCharacter, Float32 и т.д.)
-    llvm::codeview::SimpleTypeKind base;
+    llvm::codeview::SimpleTypeKind base = llvm::codeview::SimpleTypeKind::None;
 
-    // Модификаторы
-    bool isConst = false;
-    bool isPointer = false;
-
-    // Оператор сравнения нужен для std::map.
-    // Сравниваем по всем полям, чтобы разные описания не схлопнулись в один ключ.
-    bool operator<(const TypeRequest &other) const {
-        if (base != other.base) return base < other.base;
-        if (isConst != other.isConst) return isConst < other.isConst;
-        return isPointer < other.isPointer;
-    }
+    TypeQualifiers qualifiers = 0; 
+    // вложенный тип int**
+    std::shared_ptr<const TypeRequest> elementType;
+    // PDB может генерироваться для 32-битного бинарника
+    uint8_t pointerSize = 0;
+    // количество элементов массива
+    uint64_t arrayCount = 0;
+    // всего массива
+    uint64_t sizeBytes = 0;
 };
 struct FunctionSignatureRequest {
     TypeRequest returnType;                 
     std::vector<TypeRequest> argTypes;
     
-    // Оператор сравнения для std::map
-    bool operator<(const FunctionSignatureRequest &other) const {
-        if (returnType < other.returnType) return true;
-        if (other.returnType < returnType) return false;
-        return argTypes < other.argTypes;
-    }
+    llvm::codeview::CallingConvention callingConvention = llvm::codeview::CallingConvention::NearC;
+
+    bool variadic = false;
 };
 struct TPITypes {
-    // Базовые типы (int, double)
-    std::map<SimpleTypeKind, TypeIndex> SimpleTypes;
-
-    // Модифицированные типы (int*, const char, const double*)
-    std::map<TypeRequest, TypeIndex> ModifiedTypes;
-
-// Словарь сигнатур функций (ключ — описание, значение — TypeIndex)
-    std::map<FunctionSignatureRequest, llvm::codeview::TypeIndex> FunctionTypes;
-
+    std::vector<llvm::codeview::TypeIndex> SimpleTypes;
+    std::vector<llvm::codeview::TypeIndex> ComplexTypes;
+    std::vector<llvm::codeview::TypeIndex> FunctionTypes;
+};
+// описание бинарника, который анализирует IDA
+struct TPITarget {
+    uint8_t pointerSize = 8;
 };
 
-// Allocator должен жить до PdbBuilder.commit(): в нём лежат байты записей типов.
 llvm::Expected<TPITypes> generateTPI(
     llvm::pdb::PDBFileBuilder &PdbBuilder,
     llvm::BumpPtrAllocator &Allocator,
-    const std::vector<llvm::codeview::SimpleTypeKind> &RequestedSimpleTypes,
+    const TPITarget &Target,
+    const std::vector<llvm::codeview::SimpleTypeKind>
+        &RequestedSimpleTypes,
     const std::vector<TypeRequest> &RequestedComplexTypes,
-    const std::vector<FunctionSignatureRequest> &RequestedFunctions);
-                                          llvm::BumpPtrAllocator &Allocator,
-                                        std::vector<llvm::codeview::SimpleTypeKind> &RequestedTypes);
+    const std::vector<FunctionSignatureRequest>
+        &RequestedFunctions);
+
+
