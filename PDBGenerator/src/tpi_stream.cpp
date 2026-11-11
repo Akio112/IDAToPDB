@@ -4,18 +4,18 @@
 #include <cstddef>
 #include <cstdint>
 #include <limits>
+#include <string>
 #include <system_error>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/DebugInfo/CodeView/AppendingTypeTableBuilder.h"
 #include "llvm/DebugInfo/CodeView/CVRecord.h"
-#include "llvm/DebugInfo/CodeView/CodeView.h"
 #include "llvm/DebugInfo/CodeView/TypeRecord.h"
 #include "llvm/DebugInfo/PDB/Native/TpiHashing.h"
 #include "llvm/DebugInfo/PDB/Native/TpiStreamBuilder.h"
-#include "llvm/Support/Error.h"
 
 using namespace llvm;
 using namespace llvm::codeview;
@@ -30,45 +30,35 @@ constexpr TypeQualifiers KnownQualifiers =
     static_cast<TypeQualifiers>(TypeQualifier::Unaligned) |
     static_cast<TypeQualifiers>(TypeQualifier::Restrict);
 
-static Error typeError(const char *message) {
+using TypeLookup =
+    std::unordered_map<TypeId, const TypeRequest *>;
+
+// Создание ошибки с понятным текстом.
+Error typeError(const std::string &message) {
     return createStringError(
         std::errc::invalid_argument,
         "%s",
-        message
+        message.c_str()
     );
 }
 
-static bool isReference(TypeKind kind) {
+bool isReference(TypeKind kind) {
     return kind == TypeKind::LValueReference ||
            kind == TypeKind::RValueReference;
 }
 
-static bool isPointerLike(TypeKind kind) {
-    return kind == TypeKind::Pointer || isReference(kind);
+bool isPointerLike(TypeKind kind) {
+    return kind == TypeKind::Pointer ||
+           isReference(kind);
 }
 
-static bool isVoidType(const TypeRequest &req) {
-    return req.kind == TypeKind::Primitive &&
-           req.base == SimpleTypeKind::Void;
+bool isVoid(const TypeRequest &type) {
+    return type.kind == TypeKind::Primitive &&
+           type.base == SimpleTypeKind::Void;
 }
 
-static bool hasUnknownQualifiers(TypeQualifiers qualifiers) {
-    return (qualifiers & ~KnownQualifiers) != 0;
-}
-
-static uint8_t getPointerSize(
-    const TypeRequest &req,
-    const TPITarget &target) {
-
-    if (req.pointerSize != 0)
-        return req.pointerSize;
-
-    return target.pointerSize;
-}
-
-static ModifierOptions getModifierOptions(
-    TypeQualifiers qualifiers) {
-
+// Модификаторы обычных типов: const, volatile, unaligned.
+ModifierOptions modifierOptions(TypeQualifiers qualifiers) {
     ModifierOptions options = ModifierOptions::None;
 
     if (hasQualifier(qualifiers, TypeQualifier::Const))
@@ -83,9 +73,8 @@ static ModifierOptions getModifierOptions(
     return options;
 }
 
-static PointerOptions getPointerOptions(
-    TypeQualifiers qualifiers) {
-
+// Модификаторы указателей.
+PointerOptions pointerOptions(TypeQualifiers qualifiers) {
     PointerOptions options = PointerOptions::None;
 
     if (hasQualifier(qualifiers, TypeQualifier::Const))
@@ -103,370 +92,576 @@ static PointerOptions getPointerOptions(
     return options;
 }
 
-static Error validateType(
-    const TypeRequest &req,
-    const TPITarget &target,
-    unsigned depth = 0) {
+// Проверяет поля одного TypeRequest.
+//
+// Здесь мы ещё не проверяем, существует ли elementTypeId.
+// Этим займётся TypeResolver.
+Error validateTypeRequest(const TypeRequest &type) {
+    if ((type.qualifiers & ~KnownQualifiers) != 0) {
+        return typeError(
+            "Unknown qualifiers for type ID " +
+            std::to_string(type.id)
+        );
+    }
 
-    if (depth >= MaxTypeDepth)
-        return typeError("Type nesting is too deep");
+    switch (type.kind) {
+    case TypeKind::Primitive:
+        if (type.base == SimpleTypeKind::None ||
+            type.elementTypeId != 0 ||
+            type.sizeBytes != 0) {
+            return typeError(
+                "Invalid primitive type ID " +
+                std::to_string(type.id)
+            );
+        }
 
-    if (hasUnknownQualifiers(req.qualifiers))
-        return typeError("Unknown type qualifier");
+        if (hasQualifier(
+                type.qualifiers,
+                TypeQualifier::Restrict)) {
+            return typeError(
+                "Restrict is only supported on pointers"
+            );
+        }
 
-    switch (req.kind) {
-    case TypeKind::Primitive: {
-        if (req.base == SimpleTypeKind::None)
-            return typeError("Primitive type is not specified");
+        return Error::success();
 
-        if (req.elementType)
-            return typeError("Primitive cannot have elementType");
+    case TypeKind::Pointer:
+    case TypeKind::LValueReference:
+    case TypeKind::RValueReference:
+        if (type.base != SimpleTypeKind::None ||
+            type.elementTypeId == 0 ||
+            type.sizeBytes != 0) {
+            return typeError(
+                "Invalid pointer/reference type ID " +
+                std::to_string(type.id)
+            );
+        }
 
-        if (req.pointerSize != 0 ||
-            req.arrayCount != 0 ||
-            req.sizeBytes != 0)
-            return typeError("Primitive contains unrelated fields");
+        if (isReference(type.kind) &&
+            type.qualifiers != 0) {
+            return typeError(
+                "Reference cannot have top-level qualifiers"
+            );
+        }
 
-        if (hasQualifier(req.qualifiers, TypeQualifier::Restrict))
-            return typeError("Restrict is only supported on pointers");
+        return Error::success();
+
+    case TypeKind::Array:
+        if (type.base != SimpleTypeKind::None ||
+            type.elementTypeId == 0 ||
+            type.qualifiers != 0 ||
+            type.sizeBytes == 0) {
+            return typeError(
+                "Invalid array type ID " +
+                std::to_string(type.id)
+            );
+        }
 
         return Error::success();
     }
 
-    case TypeKind::Pointer:
-    case TypeKind::LValueReference:
-    case TypeKind::RValueReference: {
-        if (!req.elementType)
-            return typeError("Pointer or reference has no nested type");
-
-        if (req.base != SimpleTypeKind::None)
-            return typeError("Pointer or reference cannot specify base");
-
-        if (req.arrayCount != 0 || req.sizeBytes != 0)
-            return typeError("Pointer or reference has array fields");
-
-        const uint8_t size = getPointerSize(req, target);
-
-        if (size != 4 && size != 8)
-            return typeError("Pointer size must be 4 or 8 bytes");
-
-        if (isReference(req.kind)) {
-            if (req.qualifiers != 0)
-                return typeError(
-                    "Reference cannot have top-level qualifiers"
-                );
-
-            if (isVoidType(*req.elementType))
-                return typeError("Reference to void is invalid");
-        }
-
-        if (isReference(req.elementType->kind))
-            return typeError(
-                "Pointer or reference to reference is invalid"
-            );
-
-        return validateType(
-            *req.elementType,
-            target,
-            depth + 1
-        );
-    }
-
-    case TypeKind::Array: {
-        if (!req.elementType)
-            return typeError("Array has no element type");
-
-        if (req.base != SimpleTypeKind::None)
-            return typeError("Array cannot specify base");
-
-        if (req.qualifiers != 0)
-            return typeError(
-                "Array qualifiers must be applied to its element"
-            );
-
-        if (req.pointerSize != 0)
-            return typeError("Array cannot specify pointerSize");
-
-        if (req.arrayCount == 0)
-            return typeError("Array count must be positive");
-
-        if (req.sizeBytes == 0)
-            return typeError("Array sizeBytes must be positive");
-
-        if (isReference(req.elementType->kind))
-            return typeError("Array of references is invalid");
-
-        if (isVoidType(*req.elementType))
-            return typeError("Array of void is invalid");
-
-        return validateType(
-            *req.elementType,
-            target,
-            depth + 1
-        );
-    }
-    }
-
-    return typeError("Unsupported TypeKind");
+    return typeError(
+        "Unsupported TypeKind for type ID " +
+        std::to_string(type.id)
+    );
 }
 
-static Error validateFunction(
-    const FunctionSignatureRequest &func,
-    const TPITarget &target) {
+// Проверяет, можно ли вложить element в parent.
+//
+// Например:
+// int*  — можно
+// int&* — нельзя
+// void& — нельзя
+// void[5] — нельзя
+Error validateElementRelationship(
+    const TypeRequest &parent,
+    const TypeRequest &element) {
 
-    if (func.returnType.kind == TypeKind::Array)
-        return typeError("Function cannot return an array by value");
+    if (isReference(element.kind)) {
+        return typeError(
+            "Pointer/reference/array of reference is invalid"
+        );
+    }
 
-    if (Error err = validateType(func.returnType, target))
-        return err;
-
-    const size_t maxArgs =
-        std::numeric_limits<uint16_t>::max();
-
-    if (func.argTypes.size() > maxArgs)
-        return typeError("Too many function arguments");
-
-    if (func.variadic && func.argTypes.size() == maxArgs)
-        return typeError("Too many variadic function arguments");
-
-    for (const TypeRequest &arg : func.argTypes) {
-        if (Error err = validateType(arg, target))
-            return err;
-
-        if (isVoidType(arg))
-            return typeError(
-                "Void cannot be used as an explicit argument"
-            );
+    if ((parent.kind == TypeKind::Array ||
+         isReference(parent.kind)) &&
+        isVoid(element)) {
+        return typeError(
+            "Array/reference of void is invalid"
+        );
     }
 
     return Error::success();
 }
 
-static Expected<TypeIndex> createType(
-    const TypeRequest &req,
-    AppendingTypeTableBuilder &table,
-    const TPITarget &target) {
+// Строит таблицу TypeId -> TypeRequest.
+//
+// Дополнительно проверяет:
+// - ID не равен 0;
+// - нет повторяющихся ID;
+// - поля каждого типа корректны.
+Expected<TypeLookup> buildTypeLookup(
+    const std::vector<TypeRequest> &types) {
 
-    switch (req.kind) {
-    case TypeKind::Primitive: {
-        TypeIndex current(req.base);
+    TypeLookup lookup;
+    lookup.reserve(types.size());
 
-        const ModifierOptions options =
-            getModifierOptions(req.qualifiers);
-
-        if (options != ModifierOptions::None) {
-            ModifierRecord modifier(current, options);
-            current = table.writeLeafType(modifier);
+    for (const TypeRequest &type : types) {
+        if (type.id == 0) {
+            return typeError("Type ID 0 is reserved");
         }
 
-        return current;
+        if (!lookup.emplace(type.id, &type).second) {
+            return typeError(
+                "Duplicate type ID " +
+                std::to_string(type.id)
+            );
+        }
+
+        if (Error err = validateTypeRequest(type)) {
+            return std::move(err);
+        }
     }
 
-    case TypeKind::Pointer:
-    case TypeKind::LValueReference:
-    case TypeKind::RValueReference: {
-        auto nested = createType(
-            *req.elementType,
-            table,
-            target
+    return lookup;
+}
+
+// Разрешает зависимости между типами и создаёт
+// соответствующие CodeView TypeIndex.
+class TypeResolver {
+public:
+    TypeResolver(
+        const TPITarget &target,
+        const TypeLookup &types,
+        AppendingTypeTableBuilder &table,
+        TPITypes &result)
+        : target_(target),
+          types_(types),
+          table_(table),
+          result_(result) {}
+
+    // Основной метод:
+    // TypeId -> CodeView TypeIndex.
+    Expected<TypeIndex> resolve(
+        TypeId id,
+        unsigned depth = 0) {
+
+        // Если тип уже создан, возвращаем его индекс.
+        auto cached = result_.typeIndices.find(id);
+
+        if (cached != result_.typeIndices.end()) {
+            return cached->second;
+        }
+
+        if (depth >= MaxTypeDepth) {
+            return typeError("Type nesting is too deep");
+        }
+
+        // Находим входное описание типа.
+        auto it = types_.find(id);
+
+        if (it == types_.end()) {
+            return typeError(
+                "Unknown type ID " +
+                std::to_string(id)
+            );
+        }
+
+        // Если этот тип уже находится в процессе
+        // обработки, значит обнаружена циклическая
+        // зависимость.
+        if (states_[id] == State::Visiting) {
+            return typeError(
+                "Cyclic type dependency at ID " +
+                std::to_string(id)
+            );
+        }
+
+        states_[id] = State::Visiting;
+
+        // Создаём CodeView-запись нужного вида.
+        auto index = createType(*it->second, depth);
+
+        if (!index) {
+            states_.erase(id);
+            return index.takeError();
+        }
+
+        // Сохраняем результат, чтобы не создавать
+        // один и тот же тип повторно.
+        result_.typeIndices.emplace(id, *index);
+
+        states_[id] = State::Done;
+
+        return *index;
+    }
+
+private:
+    enum class State : uint8_t {
+        Visiting,
+        Done
+    };
+
+    // Определяет, какой именно тип нужно создать.
+    Expected<TypeIndex> createType(
+        const TypeRequest &type,
+        unsigned depth) {
+
+        if (type.kind == TypeKind::Primitive) {
+            return createPrimitive(type);
+        }
+
+        // У сложного типа должен существовать
+        // вложенный тип.
+        auto child = types_.find(type.elementTypeId);
+
+        if (child == types_.end()) {
+            return typeError(
+                "Unknown elementTypeId " +
+                std::to_string(type.elementTypeId)
+            );
+        }
+
+        if (Error err = validateElementRelationship(
+                type,
+                *child->second)) {
+            return std::move(err);
+        }
+
+        // Сначала создаём вложенный тип.
+        auto elementIndex = resolve(
+            type.elementTypeId,
+            depth + 1
         );
 
-        if (!nested)
-            return nested.takeError();
+        if (!elementIndex) {
+            return elementIndex.takeError();
+        }
 
-        const uint8_t size = getPointerSize(req, target);
+        // Затем создаём внешний тип.
+        if (isPointerLike(type.kind)) {
+            return createPointerOrReference(
+                type,
+                *elementIndex
+            );
+        }
 
-        const PointerKind pointerKind =
-            size == 8
+        if (type.kind == TypeKind::Array) {
+            return createArray(
+                type,
+                *elementIndex
+            );
+        }
+
+        return typeError("Unsupported TypeKind");
+    }
+
+    // Примитивный тип или LF_MODIFIER.
+    TypeIndex createPrimitive(const TypeRequest &type) {
+        TypeIndex index(type.base);
+
+        ModifierOptions options =
+            modifierOptions(type.qualifiers);
+
+        if (options != ModifierOptions::None) {
+            ModifierRecord modifier(index, options);
+            index = table_.writeLeafType(modifier);
+        }
+
+        return index;
+    }
+
+    // LF_POINTER для указателей и ссылок.
+    TypeIndex createPointerOrReference(
+        const TypeRequest &type,
+        TypeIndex elementIndex) {
+
+        const PointerKind kind =
+            target_.pointerSize == 8
                 ? PointerKind::Near64
                 : PointerKind::Near32;
 
         PointerMode mode = PointerMode::Pointer;
 
-        if (req.kind == TypeKind::LValueReference)
+        if (type.kind == TypeKind::LValueReference) {
             mode = PointerMode::LValueReference;
-        else if (req.kind == TypeKind::RValueReference)
+        }
+        else if (type.kind == TypeKind::RValueReference) {
             mode = PointerMode::RValueReference;
+        }
 
         PointerRecord pointer(
-            *nested,
-            pointerKind,
+            elementIndex,
+            kind,
             mode,
-            getPointerOptions(req.qualifiers),
-            size
+            pointerOptions(type.qualifiers),
+            target_.pointerSize
         );
 
-        return table.writeLeafType(pointer);
+        return table_.writeLeafType(pointer);
     }
 
-    case TypeKind::Array: {
-        auto elementIndex = createType(
-            *req.elementType,
-            table,
-            target
-        );
+    // LF_ARRAY.
+    TypeIndex createArray(
+        const TypeRequest &type,
+        TypeIndex elementIndex) {
 
-        if (!elementIndex)
-            return elementIndex.takeError();
-
-        // LF_ARRAY хранит полный размер массива в байтах.
-        // Для обычного массива индексным типом используем UInt32.
+        // LF_ARRAY хранит полный размер массива
+        // в байтах, а не число элементов.
         ArrayRecord array(
-            *elementIndex,
+            elementIndex,
             TypeIndex(SimpleTypeKind::UInt32),
-            req.sizeBytes,
+            type.sizeBytes,
             ""
         );
 
-        return table.writeLeafType(array);
-    }
+        return table_.writeLeafType(array);
     }
 
-    return typeError("Unsupported TypeKind");
+    const TPITarget &target_;
+    const TypeLookup &types_;
+    AppendingTypeTableBuilder &table_;
+    TPITypes &result_;
+
+    // Отслеживает типы, находящиеся в обработке.
+    std::unordered_map<TypeId, State> states_;
+};
+
+// Проверяет корректность сигнатуры функции.
+Error validateFunction(
+    const FunctionSignatureRequest &func,
+    const TypeLookup &types) {
+
+    auto ret = types.find(func.returnTypeId);
+
+    if (ret == types.end()) {
+        return typeError(
+            "Unknown function return type ID " +
+            std::to_string(func.returnTypeId)
+        );
+    }
+
+    if (ret->second->kind == TypeKind::Array) {
+        return typeError(
+            "Function cannot return an array by value"
+        );
+    }
+
+    const size_t maxArgs =
+        std::numeric_limits<uint16_t>::max();
+
+    if (func.argTypeIds.size() > maxArgs ||
+        (func.variadic &&
+         func.argTypeIds.size() == maxArgs)) {
+        return typeError(
+            "Too many function arguments"
+        );
+    }
+
+    for (TypeId id : func.argTypeIds) {
+        auto arg = types.find(id);
+
+        if (arg == types.end()) {
+            return typeError(
+                "Unknown function argument type ID " +
+                std::to_string(id)
+            );
+        }
+
+        if (isVoid(*arg->second)) {
+            return typeError(
+                "Void cannot be an explicit argument"
+            );
+        }
+    }
+
+    return Error::success();
 }
 
-static Expected<TypeIndex> createFunctionSignature(
+// Преобразует ID аргументов функции
+// в настоящие CodeView TypeIndex.
+Expected<std::vector<TypeIndex>> resolveArguments(
     const FunctionSignatureRequest &func,
-    AppendingTypeTableBuilder &table,
-    const TPITarget &target) {
+    TypeResolver &resolver) {
 
-    auto returnIndex = createType(
-        func.returnType,
-        table,
-        target
-    );
+    std::vector<TypeIndex> indices;
 
-    if (!returnIndex)
-        return returnIndex.takeError();
-
-    std::vector<TypeIndex> argumentIndices;
-
-    argumentIndices.reserve(
-        func.argTypes.size() +
+    indices.reserve(
+        func.argTypeIds.size() +
         static_cast<size_t>(func.variadic)
     );
 
-    for (const TypeRequest &arg : func.argTypes) {
-        auto argIndex = createType(
-            arg,
-            table,
-            target
-        );
+    for (TypeId id : func.argTypeIds) {
+        auto index = resolver.resolve(id);
 
-        if (!argIndex)
-            return argIndex.takeError();
+        if (!index) {
+            return index.takeError();
+        }
 
-        argumentIndices.push_back(*argIndex);
+        indices.push_back(*index);
     }
 
+    // Завершающий TypeIndex::None() обозначает "...".
     if (func.variadic) {
-        // Завершающий T_NOTYPE обозначает "...".
-        argumentIndices.push_back(TypeIndex::None());
+        indices.push_back(TypeIndex::None());
     }
 
-    ArgListRecord argList(
-        TypeRecordKind::ArgList,
-        argumentIndices
+    return indices;
+}
+
+// Создаёт сигнатуру функции:
+// LF_ARGLIST + LF_PROCEDURE.
+Expected<TypeIndex> createFunctionSignature(
+    const FunctionSignatureRequest &func,
+    TypeResolver &resolver,
+    AppendingTypeTableBuilder &table) {
+
+    // Тип возвращаемого значения.
+    auto returnIndex = resolver.resolve(
+        func.returnTypeId
     );
 
-    TypeIndex argListIndex = table.writeLeafType(argList);
+    if (!returnIndex) {
+        return returnIndex.takeError();
+    }
 
+    // Типы аргументов.
+    auto args = resolveArguments(func, resolver);
+
+    if (!args) {
+        return args.takeError();
+    }
+
+    // LF_ARGLIST содержит список типов аргументов.
+    ArgListRecord argList(
+        TypeRecordKind::ArgList,
+        *args
+    );
+
+    TypeIndex argListIndex =
+        table.writeLeafType(argList);
+
+    // LF_PROCEDURE описывает сигнатуру функции
+    // и ссылается на LF_ARGLIST.
     ProcedureRecord procedure(
         *returnIndex,
         func.callingConvention,
         FunctionOptions::None,
-        static_cast<uint16_t>(argumentIndices.size()),
+        static_cast<uint16_t>(args->size()),
         argListIndex
     );
 
     return table.writeLeafType(procedure);
 }
 
+// Переносит записи из временной таблицы
+// в TPI-поток создаваемого PDB.
+Error writeTpiRecords(
+    pdb::PDBFileBuilder &pdbBuilder,
+    AppendingTypeTableBuilder &table) {
+
+    auto &tpiBuilder =
+        pdbBuilder.getTpiBuilder();
+
+    for (ArrayRef<uint8_t> bytes : table.records()) {
+        auto hash = pdb::hashTypeRecord(
+            CVType(bytes)
+        );
+
+        if (!hash) {
+            return hash.takeError();
+        }
+
+        tpiBuilder.addTypeRecord(bytes, *hash);
+    }
+
+    return Error::success();
+}
+
 } // namespace
 
+// Главная функция генерации TPI.
 Expected<TPITypes> generateTPI(
     pdb::PDBFileBuilder &PdbBuilder,
     BumpPtrAllocator &Allocator,
     const TPITarget &Target,
-    const std::vector<SimpleTypeKind> &RequestedSimpleTypes,
-    const std::vector<TypeRequest> &RequestedComplexTypes,
-    const std::vector<FunctionSignatureRequest> &RequestedFunctions) {
+    const std::vector<TypeRequest> &RequestedTypes,
+    const std::vector<FunctionSignatureRequest>
+        &RequestedFunctions) {
 
-    if (Target.pointerSize != 4 && Target.pointerSize != 8)
+    if (Target.pointerSize != 4 &&
+        Target.pointerSize != 8) {
         return typeError(
             "Target pointer size must be 4 or 8 bytes"
         );
-
-    // Проверяем запросы до записи в TPI.
-    for (const TypeRequest &req : RequestedComplexTypes) {
-        if (Error err = validateType(req, Target))
-            return std::move(err);
     }
 
+    // Строим таблицу ID -> TypeRequest.
+    // Проверяем уникальность ID и корректность полей.
+    auto types = buildTypeLookup(RequestedTypes);
+
+    if (!types) {
+        return types.takeError();
+    }
+
+    // Проверяем сигнатуры до записи CodeView-записей.
     for (const FunctionSignatureRequest &func
          : RequestedFunctions) {
 
-        if (Error err = validateFunction(func, Target))
+        if (Error err = validateFunction(func, *types)) {
             return std::move(err);
+        }
     }
 
     AppendingTypeTableBuilder table(Allocator);
+
     TPITypes result{};
 
-    result.SimpleTypes.reserve(RequestedSimpleTypes.size());
-    result.ComplexTypes.reserve(RequestedComplexTypes.size());
-    result.FunctionTypes.reserve(RequestedFunctions.size());
+    result.typeIndices.reserve(
+        RequestedTypes.size()
+    );
 
-    // Простые типы уже имеют встроенные CodeView TypeIndex.
-    for (SimpleTypeKind kind : RequestedSimpleTypes) {
-        if (kind == SimpleTypeKind::None)
-            return typeError(
-                "Requested simple type cannot be None"
-            );
+    result.functionTypes.reserve(
+        RequestedFunctions.size()
+    );
 
-        result.SimpleTypes.emplace_back(kind);
-    }
+    TypeResolver resolver(
+        Target,
+        *types,
+        table,
+        result
+    );
 
-    // Сложные типы.
-    for (const TypeRequest &req : RequestedComplexTypes) {
-        auto index = createType(
-            req,
-            table,
-            Target
-        );
+    // Создаём типы. Порядок входного списка не важен.
+    for (const TypeRequest &type : RequestedTypes) {
+        auto index = resolver.resolve(type.id);
 
-        if (!index)
+        if (!index) {
             return index.takeError();
-
-        result.ComplexTypes.push_back(*index);
+        }
     }
 
-    // Сигнатуры функций.
+    // Создаём сигнатуры функций.
     for (const FunctionSignatureRequest &func
          : RequestedFunctions) {
 
         auto index = createFunctionSignature(
             func,
-            table,
-            Target
+            resolver,
+            table
         );
 
-        if (!index)
+        if (!index) {
             return index.takeError();
+        }
 
-        result.FunctionTypes.push_back(*index);
+        // Сохраняем TypeIndex в порядке входных функций.
+        result.functionTypes.push_back(*index);
     }
 
-    // Перенос всех созданных записей в TPI-поток PDB.
-    auto &tpiBuilder = PdbBuilder.getTpiBuilder();
-
-    for (ArrayRef<uint8_t> bytes : table.records()) {
-        auto hash = pdb::hashTypeRecord(CVType(bytes));
-
-        if (!hash)
-            return hash.takeError();
-
-        tpiBuilder.addTypeRecord(bytes, *hash);
+    // Записываем готовые CodeView-записи в TPI.
+    if (Error err = writeTpiRecords(PdbBuilder, table)) {
+        return std::move(err);
     }
 
     return result;
