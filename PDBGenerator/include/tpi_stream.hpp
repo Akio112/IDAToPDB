@@ -1,60 +1,121 @@
-// ===== Поток TPI (типы) =====
-// Часть Анны: типы функций int(int, int), int(const char*), int().
-// Позже (когда будут символы функций внутри модуля) на эти типы будут ссылаться по номеру.
+
 #pragma once
 
 #include "llvm/DebugInfo/CodeView/TypeIndex.h"
+#include "llvm/DebugInfo/CodeView/CodeView.h"
 #include "llvm/DebugInfo/PDB/Native/PDBFileBuilder.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/Error.h"
-#include <map>
+
+#include <cstdint>
+#include <unordered_map>
 #include <vector>
 
+// ID типа внутри одного вызова generateTPI.
+// Значение 0 зарезервировано и не является допустимым ID.
+using TypeId = uint32_t;
+
+enum class TypeKind : uint8_t {
+    Primitive = 0,
+    Pointer = 1,
+    LValueReference = 2,
+    RValueReference = 3,
+    Array = 4
+};
+
+enum class TypeQualifier : uint16_t {
+    None      = 0,
+    Const     = 1 << 0,
+    Volatile  = 1 << 1,
+    Unaligned = 1 << 2,
+    Restrict  = 1 << 3
+};
+
+using TypeQualifiers = uint16_t;
+
+constexpr TypeQualifiers operator|(
+    TypeQualifier lhs,
+    TypeQualifier rhs) {
+
+    return static_cast<TypeQualifiers>(lhs) |
+           static_cast<TypeQualifiers>(rhs);
+}
+
+constexpr TypeQualifiers operator|(
+    TypeQualifiers lhs,
+    TypeQualifier rhs) {
+
+    return lhs | static_cast<TypeQualifiers>(rhs);
+}
+
+constexpr bool hasQualifier(
+    TypeQualifiers flags,
+    TypeQualifier qualifier) {
+
+    return (flags & static_cast<TypeQualifiers>(qualifier)) != 0;
+}
+
+// Описание одного типа.
+//
+// Вложенные типы задаются через elementTypeId,
+// а не через shared_ptr или вложенный TypeRequest.
 struct TypeRequest {
-    // Базовый тип (Int32, NarrowCharacter, Float32 и т.д.)
-    llvm::codeview::SimpleTypeKind base;
+    TypeId id = 0;
 
-    // Модификаторы
-    bool isConst = false;
-    bool isPointer = false;
+    TypeKind kind = TypeKind::Primitive;
 
-    // Оператор сравнения нужен для std::map.
-    // Сравниваем по всем полям, чтобы разные описания не схлопнулись в один ключ.
-    bool operator<(const TypeRequest &other) const {
-        if (base != other.base) return base < other.base;
-        if (isConst != other.isConst) return isConst < other.isConst;
-        return isPointer < other.isPointer;
-    }
+    // Используется только для Primitive.
+    llvm::codeview::SimpleTypeKind base =
+        llvm::codeview::SimpleTypeKind::None;
+
+    TypeQualifiers qualifiers = 0;
+
+    // ID типа, на который ссылается указатель/ссылка,
+    // или ID типа элемента массива.
+    // Для Primitive должен быть равен 0.
+    TypeId elementTypeId = 0;
+
+    // Полный размер массива в байтах, а не одного элемента.
+    uint64_t sizeBytes = 0;
 };
+
+// Описание сигнатуры функции.
+//
+// Собственный ID не нужен: результаты возвращаются
+// в том же порядке, что и входные сигнатуры.
 struct FunctionSignatureRequest {
-    TypeRequest returnType;                 
-    std::vector<TypeRequest> argTypes;
-    
-    // Оператор сравнения для std::map
-    bool operator<(const FunctionSignatureRequest &other) const {
-        if (returnType < other.returnType) return true;
-        if (other.returnType < returnType) return false;
-        return argTypes < other.argTypes;
-    }
+    TypeId returnTypeId = 0;
+
+    std::vector<TypeId> argTypeIds;
+
+    llvm::codeview::CallingConvention callingConvention =
+        llvm::codeview::CallingConvention::NearC;
+
+    bool variadic = false;
 };
+
+// Результат генерации TPI.
 struct TPITypes {
-    // Базовые типы (int, double)
-    std::map<SimpleTypeKind, TypeIndex> SimpleTypes;
+    // ID входного типа -> настоящий CodeView TypeIndex.
+    std::unordered_map<
+        TypeId,
+        llvm::codeview::TypeIndex
+    > typeIndices;
 
-    // Модифицированные типы (int*, const char, const double*)
-    std::map<TypeRequest, TypeIndex> ModifiedTypes;
-
-// Словарь сигнатур функций (ключ — описание, значение — TypeIndex)
-    std::map<FunctionSignatureRequest, llvm::codeview::TypeIndex> FunctionTypes;
-
+    // TypeIndex сигнатур в порядке RequestedFunctions.
+    std::vector<llvm::codeview::TypeIndex> functionTypes;
 };
 
-// Allocator должен жить до PdbBuilder.commit(): в нём лежат байты записей типов.
+// Параметры анализируемого бинарника.
+struct TPITarget {
+    // 4 для 32-битного, 8 для 64-битного бинарника.
+    uint8_t pointerSize = 8;
+};
+
 llvm::Expected<TPITypes> generateTPI(
     llvm::pdb::PDBFileBuilder &PdbBuilder,
     llvm::BumpPtrAllocator &Allocator,
-    const std::vector<llvm::codeview::SimpleTypeKind> &RequestedSimpleTypes,
-    const std::vector<TypeRequest> &RequestedComplexTypes,
-    const std::vector<FunctionSignatureRequest> &RequestedFunctions);
-                                          llvm::BumpPtrAllocator &Allocator,
-                                        std::vector<llvm::codeview::SimpleTypeKind> &RequestedTypes);
+    const TPITarget &Target,
+    const std::vector<TypeRequest> &RequestedTypes,
+    const std::vector<FunctionSignatureRequest> &RequestedFunctions
+);

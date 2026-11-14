@@ -1,106 +1,80 @@
-// Собирает целый PDB для demo.exe. Ваша часть (DBI) в dbi_stream.cpp, типы (TPI) в tpi_stream.cpp,
-// остальное здесь это "обвязка", чтобы получить файл и сверить его с эталоном.
-#include <array>
+// Тестовый запуск генератора: заполняет Input данными demo.exe (так же, как потом это будет делать
+// скрипт Амра из IDA) и вызывает pdbgen::generate. Результат проверяется в WinDbg.
+//
+// Адреса и размеры ниже верны для нашего demo.exe (см. reference/demo.pdb), для другого exe они будут другими.
 #include <cstdint>
-#include <string_view>
+#include <exception>
+#include <iostream>
 #include <utility>
 #include <vector>
 
-#include "dbi_stream.hpp"
-#include "info_stream.hpp"
-#include "llvm/DebugInfo/CodeView/GUID.h"
-#include "llvm/DebugInfo/MSF/MSFBuilder.h"
-#include "llvm/DebugInfo/PDB/Native/GSIStreamBuilder.h"
-#include "llvm/DebugInfo/PDB/Native/RawConstants.h"
-#include "llvm/DebugInfo/PDB/Native/TpiStreamBuilder.h"
-#include "llvm/Support/Allocator.h"
-#include "llvm/Support/raw_ostream.h"
-#include "tpi_stream.hpp"
-
-using namespace llvm;
-using namespace llvm::pdb;
+#include "pdb_generator.hpp"
 
 namespace {
 
-struct PublicFunction {
-    std::string_view name;
-    std::uint32_t offsetInText;  // смещение внутри .text (секция №1)
-};
+pdbgen::Type makeType(std::uint32_t id, const char* kind, const char* base, std::uint16_t qualifiers,
+                      std::uint32_t elementTypeId) {
+    pdbgen::Type type;
+    type.id = id;
+    type.kind = kind;
+    type.base = base;
+    type.qualifiers = qualifiers;
+    type.elementTypeId = elementTypeId;
+    return type;
+}
 
-// В реальном проекте этот список приходит из YAML (IDA). Здесь значения demo.exe.
-constexpr std::array<PublicFunction, 4> kDemoFunctions = {{
-    {"my_add", 0x00},
-    {"my_multiply", 0x20},
-    {"my_check_password", 0x40},
-    {"main", 0xF0},
-}};
+pdbgen::Signature makeSignature(std::uint32_t returnTypeId, std::vector<std::uint32_t> args) {
+    pdbgen::Signature signature;
+    signature.returnTypeId = returnTypeId;
+    signature.argTypeIds = std::move(args);
+    return signature;
+}
 
-int fail(Error err) {
-    errs() << "ошибка: " << toString(std::move(err)) << '\n';
-    return 1;
+pdbgen::Function makeFunction(const char* name, std::uint32_t rva, std::uint32_t size,
+                              std::int32_t signatureIndex) {
+    pdbgen::Function fn;
+    fn.name = name;
+    fn.rva = rva;
+    fn.size = size;
+    fn.signatureIndex = signatureIndex;
+    return fn;
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc != 3) {
-        errs() << "использование: make_pdb <demo.exe> <выходной.pdb>\n";
+        std::cerr << "использование: make_pdb <demo.exe> <выходной.pdb>\n";
         return 2;
     }
 
-    auto image = readPeImage(argv[1]);
-    if (!image) {
-        return fail(image.takeError());
-    }
+    pdbgen::Input input;
+    input.pePath = argv[1];
+    input.outPath = argv[2];
+    input.pointerSize = 8;
 
-    BumpPtrAllocator allocator;
-    PDBFileBuilder builder(allocator);
-    if (Error err = builder.initialize(4096)) {
-        return fail(std::move(err));
-    }
-    // Служебные потоки 0..4 (старый каталог, PDB, TPI, DBI, IPI) должны существовать заранее.
-    for (std::uint32_t i = 0; i < kSpecialStreamCount; ++i) {
-        if (auto id = builder.getMsfBuilder().addStream(0); !id) {
-            return fail(id.takeError());
-        }
-    }
+    // Типы: 1 = int, 2 = const char, 3 = const char*.
+    input.types.push_back(makeType(1, "Primitive", "Int32", 0, 0));
+    input.types.push_back(makeType(2, "Primitive", "NarrowCharacter", 1, 0));
+    input.types.push_back(makeType(3, "Pointer", "", 0, 2));
 
-    // Поток 1 (PDB Stream): GUID и Age.
-    if (Error err = buildInfoStream(builder, *image)) {
-        return fail(std::move(err));
-    }
+    // Сигнатуры: 0 = int(int, int), 1 = int(const char*), 2 = int().
+    input.signatures.push_back(makeSignature(1, {1, 1}));
+    input.signatures.push_back(makeSignature(1, {3}));
+    input.signatures.push_back(makeSignature(1, {}));
 
-    // Поток TPI: типы функций (часть Анны). IPI остаётся пустым, но присутствовать обязан.
-    auto types = generateTPI(builder, allocator);
-    if (!types) {
-        return fail(types.takeError());
-    }
-    builder.getIpiBuilder().setVersionHeader(PdbTpiV80);
+    // Функции (rva и размеры из эталонного PDB).
+    input.functions.push_back(makeFunction("my_add", 4096, 17, 0));
+    input.functions.push_back(makeFunction("my_multiply", 4128, 18, 0));
+    input.functions.push_back(makeFunction("my_check_password", 4160, 174, 1));
+    input.functions.push_back(makeFunction("main", 4336, 103, 2));
 
-    // Публичные символы (имя + секция:смещение). Нужны WinDbg, чтобы показать имена.
-    std::vector<BulkPublic> publics;
-    for (const auto& fn : kDemoFunctions) {
-        BulkPublic pub;
-        pub.Name = fn.name.data();
-        pub.NameLen = static_cast<std::uint32_t>(fn.name.size());
-        pub.Segment = 1;
-        pub.Offset = fn.offsetInText;
-        pub.setFlags(codeview::PublicSymFlags::Function);
-        publics.push_back(pub);
+    try {
+        pdbgen::generate(input);
+    } catch (const std::exception& error) {
+        std::cerr << "ошибка: " << error.what() << '\n';
+        return 1;
     }
-    builder.getGsiBuilder().addPublicSymbols(std::move(publics));
-
-    // ===== Поток DBI: ваша часть =====
-    const StringRef sources[] = {"demo.c"};
-    DbiInput input{*image, "demo.obj", sources};
-    if (Error err = buildDbiStream(builder, input)) {
-        return fail(std::move(err));
-    }
-
-    codeview::GUID written{};
-    if (Error err = builder.commit(argv[2], &written)) {
-        return fail(std::move(err));
-    }
-    outs() << "готово: " << argv[2] << " (age = " << image->age << ")\n";
+    std::cout << "готово: " << input.outPath << '\n';
     return 0;
 }

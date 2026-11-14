@@ -3,12 +3,76 @@
 #include <cstddef>
 #include <cstdint>
 
+#include "llvm/DebugInfo/CodeView/CVRecord.h"
+#include "llvm/DebugInfo/CodeView/CodeView.h"
+#include "llvm/DebugInfo/CodeView/SymbolRecord.h"
+#include "llvm/DebugInfo/CodeView/SymbolSerializer.h"
 #include "llvm/DebugInfo/PDB/Native/DbiModuleDescriptorBuilder.h"
 #include "llvm/DebugInfo/PDB/Native/DbiStreamBuilder.h"
+#include "llvm/DebugInfo/PDB/Native/GSIStreamBuilder.h"
 #include "llvm/DebugInfo/PDB/Native/RawTypes.h"
 
 using namespace llvm;
 using namespace llvm::pdb;
+using namespace llvm::codeview;
+
+namespace {
+
+// Запись S_END (закрывает функцию) целиком, 4 байта:
+//   длина записи без этого поля = 2, тип записи 0x0006 (S_END). Оба числа little-endian.
+// Живёт всю программу (static), потому что LLVM хранит ссылку на эти байты до commit().
+const std::uint8_t kScopeEndRecord[] = {0x02, 0x00, 0x06, 0x00};
+
+// Кладёт в модуль пару "S_GPROC32 ... S_END" для каждой функции.
+// Для каждой функции ещё кладёт в глобальный поток ссылку S_PROCREF: "функция с таким именем
+// лежит в модуле №N по такому смещению". WinDbg ищет функцию по имени именно через эти ссылки.
+void addFunctionSymbols(DbiModuleDescriptorBuilder& module, GSIStreamBuilder& globals,
+                        std::uint16_t moduleNumber, const DbiInput& input) {
+    // Поток символов модуля начинается с 4-байтовой сигнатуры (C13).
+    // Поле End у функции = смещение её S_END от начала потока, поэтому считаем его с учётом сигнатуры.
+    std::uint32_t streamOffset = sizeof(std::uint32_t);
+
+    for (const FunctionSymbol& fn : input.functions) {
+        ProcSym proc(SymbolRecordKind::GlobalProcSym);  // S_GPROC32
+        proc.Parent = 0;       // функция верхнего уровня, внутри другой функции не лежит
+        proc.Next = 0;
+        proc.CodeSize = fn.size;
+        proc.DbgStart = 0;     // упрощение: начало тела (после пролога) совпадает с началом функции
+        proc.DbgEnd = fn.size; // упрощение: конец тела (до эпилога) совпадает с концом функции
+        proc.FunctionType = fn.type;
+        proc.CodeOffset = fn.offset;
+        proc.Segment = fn.segment;
+        proc.Flags = ProcSymFlags::None;
+        proc.Name = fn.name;
+
+        // Размер записи зависит только от длины имени, поэтому сначала пишем "пробную" копию,
+        // узнаём длину, и по ней вычисляем End (S_END идёт сразу за функцией).
+        const CVSymbol probe =
+            SymbolSerializer::writeOneSymbol(proc, input.allocator, CodeViewContainer::Pdb);
+        proc.End = streamOffset + static_cast<std::uint32_t>(probe.length());
+
+        const CVSymbol procRecord =
+            SymbolSerializer::writeOneSymbol(proc, input.allocator, CodeViewContainer::Pdb);
+        module.addSymbol(procRecord);
+
+        // Ссылка из глобального потока. Смещение считается от начала потока модуля (с сигнатурой),
+        // то есть это значение streamOffset до добавления самой записи функции.
+        ProcRefSym ref(SymbolRecordKind::ProcRefSym);
+        ref.SumName = 0;
+        ref.SymOffset = streamOffset;
+        ref.Module = moduleNumber;  // номера модулей в S_PROCREF начинаются с 1
+        ref.Name = fn.name;
+        globals.addGlobalSymbol(
+            SymbolSerializer::writeOneSymbol(ref, input.allocator, CodeViewContainer::Pdb));
+
+        streamOffset += static_cast<std::uint32_t>(procRecord.length());
+
+        module.addSymbol(CVSymbol(ArrayRef<std::uint8_t>(kScopeEndRecord)));
+        streamOffset += sizeof(kScopeEndRecord);
+    }
+}
+
+}  // namespace
 
 Error buildDbiStream(PDBFileBuilder& builder, const DbiInput& input) {
     const PeImage& image = input.image;
@@ -34,6 +98,9 @@ Error buildDbiStream(PDBFileBuilder& builder, const DbiInput& input) {
             return err;
         }
     }
+
+    // 3.5. Символы функций внутри модуля: где функция начинается, какой у неё размер и тип.
+    addFunctionSymbols(*module, builder.getGsiBuilder(), 1, input);
 
     // 4. SectionContribution: "эта часть секции принадлежит модулю №0".
     //    Упрощение: модуль 0 владеет секцией целиком, от смещения 0 до конца.
