@@ -20,17 +20,19 @@ endif()
 
 llvm_map_components_to_libnames(LLVM_LIBS DebugInfoPDB DebugInfoMSF DebugInfoCodeView Object BinaryFormat Support)
 
-# Исполняемый файл с учетом новой структуры папки src/
-add_executable(make_pdb 
-    src/main.cpp 
-    src/dbi_stream.cpp 
-    src/info_stream.cpp 
-    src/tpi_stream.cpp 
+# Библиотека генератора. Её же подключает обёртка pybind11 (Амр): публичный заголовок include/pdb_generator.hpp.
+add_library(pdbgen STATIC
+    src/pdb_generator.cpp
+    src/dbi_stream.cpp
+    src/info_stream.cpp
+    src/tpi_stream.cpp
     src/pe_image.cpp
 )
+target_include_directories(pdbgen PUBLIC include)
+target_include_directories(pdbgen SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
+target_compile_definitions(pdbgen PRIVATE ${LLVM_DEFINITIONS})
+target_link_libraries(pdbgen PUBLIC ${LLVM_LIBS})
 
-# Подключение заголовочных файлов из папки include/
-target_include_directories(make_pdb PRIVATE include)
-target_include_directories(make_pdb SYSTEM PRIVATE ${LLVM_INCLUDE_DIRS})
-target_compile_definitions(make_pdb PRIVATE ${LLVM_DEFINITIONS})
-target_link_libraries(make_pdb PRIVATE ${LLVM_LIBS})
+# Тестовый запуск: заполняет данные demo.exe и вызывает pdbgen::generate.
+add_executable(make_pdb src/main.cpp)
+target_link_libraries(make_pdb PRIVATE pdbgen)
