@@ -298,8 +298,8 @@ public:
 
 private:
     enum class State : uint8_t {
-        Visiting,
-        Done
+        Visiting=1,
+        Done=2
     };
 
     // Определяет, какой именно тип нужно создать.
